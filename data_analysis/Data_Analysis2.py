@@ -11,7 +11,7 @@ Created on Wed Jul 24 08:59:42 2024
 
 @author: Salma Elnagar
 """
-
+ #%%
 import scipy.io
 import pandas as pd
 # import matlab.engine
@@ -21,7 +21,7 @@ phase = 'Training'
 participants = [98]
 df_results = pd.DataFrame()  # create results df to populate later
 
-
+ #%%
 for n, participant_number in enumerate(participants):
     # Load results .mat file
     file_pathway_test = f'/Users/elnagaradmin/ownCloud (2)/Salmas_PhD_NM/Project3/Code/sbj{participant_number}Test.mat'
