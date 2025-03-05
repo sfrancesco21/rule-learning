@@ -5,7 +5,26 @@ import copy
 from scipy.special import logsumexp
 from scipy.spatial.distance import pdist, squareform
 from random import shuffle, sample
+import logging
+import scipy as sp
 
+
+def robust_cholesky(A):
+    eps = 1e-6
+    L = None
+    jitter = 0
+    for i in range(3):
+        try:
+            L = sp.linalg.cholesky(A)
+            logging.info(f"Successful Cholesky decomposion after jittering={jitter}")
+            break
+        except np.linalg.LinAlgError as e:
+            pass
+        jitter = 10**i * eps
+        A = A + jitter * np.eye(A.shape[0])
+    if L is None:
+        print("Cholesky decomposition failed after jittering. Cheating")
+    return L, A
 
 class GMMWM_Agent:
     def __init__(self, config):
@@ -23,7 +42,7 @@ class GMMWM_Agent:
         # initial uncertainty
         self.start_p = config['Initial uncertainty']
         # initial variance of clusters
-        self.sigma0 = config['Sigma0']
+        self.sigma0 = config['Sigma0']**2
         # Initialise working memory
         self.working_memory = []
         # Initialise alphas
@@ -55,18 +74,30 @@ class GMMWM_Agent:
         self.wm_p = []
         # Initialise cluster strategy probability
         self.cl_p = []
-        # Initialise relative weight of clustering model
-        self.phi = config['Cluster strategy weight']
-        self.phis = [config['Cluster strategy weight']]
+        #strategy values
+        if self.switch:
+            self.Q = config['strategy bias'] * np.array([config['Cluster strategy weight'], 1-config['Cluster strategy weight']])
+            # Initialise relative weight of clustering model
+            self.phi = self.Q[0]/np.sum(self.Q)
+            self.phis = [self.Q[0]/np.sum(self.Q)]
+        else:
+            self.phi = config['Cluster strategy weight']
+            self.phis = [config['Cluster strategy weight']]
         # Set strategy for pruning clusters:
         self.pruning = config['Pruning strategy']
         
+    
+    def logit_transform(self, x):
+        x = (x-1+1e-7)/5
+        return np.log(x/(1-x))
+
     def infer_cluster(self, stimulus):
         logjoint = []
         for alpha, mu, sigma in zip(self.alpha, self.mu, self.Sigma):
             lj = np.log(alpha/np.sum(self.alpha)) + multivariate_normal.logpdf(stimulus, mu, sigma)
             logjoint.append(lj)
-        r = np.exp(logjoint)/np.sum(np.exp(logjoint))
+        denominator = logsumexp(logjoint)
+        r = np.exp(logjoint - denominator)
         return r
         
     def infer_wm(self, stimulus):
@@ -152,6 +183,12 @@ class GMMWM_Agent:
         idx2 = -1
         for i in loop1:
             for j in range(len(self.label)):
+                try:
+                    fff = [self.label[i], self.label[j], self.v[i], self.v[j]]
+                except:
+                    print(i, j)
+                    print(self.label, self.v)
+                    print(loop1)
                 if self.label[i] == self.label[j] and i != j and self.v[i] > self.ceasefire and self.v[j] > self.ceasefire:
                     if self.pruning['criterion'] == 'KLD':
                         crit = self.kl_divergence(self.mu[i], self.Sigma[i], self.mu[i], self.Sigma[i])
@@ -269,11 +306,16 @@ class GMMWM_Agent:
         if self.wm_p[-1][0] > -0.5 and self.switch:
             Q_wm = self.wm_p[-1][label]*r_wm#*(1-self.phi)
             Q_cl = self.cl_p[-1][label]*r_cl#*self.phi
-            Q = np.array([self.phi, 1-self.phi]) + self.lr*np.array([Q_cl, Q_wm])
-            for i in range(len(Q)):
-                if Q[i] < 0:
-                    Q[i] = 0
-            self.phi = Q[0]/np.sum(Q)
+            # Q = np.array([self.phi, 1-self.phi]) + self.lr*np.array([Q_cl, Q_wm])
+            # for i in range(len(Q)):
+            #     if Q[i] < 0:
+            #         Q[i] = 0
+            # self.phi = Q[0]/np.sum(Q)
+            self.Q += np.array([Q_cl, Q_wm])
+            for i in range(len(self.Q)):
+                if self.Q[i] < 0:
+                    self.Q[i] = 0
+            self.phi = self.Q[0]/np.sum(self.Q)
             self.phis.append(self.phi)
             self.max_clusters = max(self.min_clusters, np.round(self.tot_memory*self.phi))
         r = self.r[-1]*(label == self.stim_labels[-1])
@@ -319,24 +361,32 @@ class GMMWM_Agent:
                     e = stimulus - self.mu[i]
 
                     #self.Sigma[i] = (1-w)*self.Sigma[i] + w * np.matmul(e.T, e) - np.matmul(dm.T, dm) + np.eye(len(e)) * 1e-6
-                    new_cov = (1 - w) * self.Sigma[i] + w * np.outer(e, e) + np.eye(len(e)) * 1e-10 - np.outer(dm, dm)
+                    new_cov = (1 - w) * self.Sigma[i] + w * np.outer(e, e) + np.eye(len(e)) * 1e-10 #- np.outer(dm, dm)
+
+                    _, new_cov = robust_cholesky(new_cov)
 
                     if self.is_positive_semi_definite(new_cov):
                         self.Sigma[i] = new_cov
                     else:
+                        #print("Cholesky decomposition failed after jittering. Cheating")
                         self.Sigma[i] = (1 - w) * self.Sigma[i] + w * np.outer(e, e) + np.eye(len(e)) * 1e-10
-                        print('INVALID COVARIANCE MATRIX')
-                        print('cluster', i)
-                        print('resp', r[i])
-                        print('mean', self.mu[i])
-                        print('stimulus', stimulus)
-                        print('sigma:')
-                        print(self.Sigma[i])
-                        print('w:', w)
-                        print('e1:', e1)
-                        print('e2:', e)
-                        print('diff:')
-                        print(w*np.outer(e, e) - np.outer(dm, dm))
+
+                    # if self.is_positive_semi_definite(new_cov):
+                    #     self.Sigma[i] = new_cov
+                    # else:
+                    #     self.Sigma[i] = (1 - w) * self.Sigma[i] + w * np.outer(e, e) + np.eye(len(e)) * 1e-10
+                        # print('INVALID COVARIANCE MATRIX')
+                        # print('cluster', i)
+                        # print('resp', r[i])
+                        # print('mean', self.mu[i])
+                        # print('stimulus', stimulus)
+                        # print('sigma:')
+                        # print(self.Sigma[i])
+                        # print('w:', w)
+                        # print('e1:', e1)
+                        # print('e2:', e)
+                        # print('diff:')
+                        # print(w*np.outer(e, e) - np.outer(dm, dm))
                 
                 self.sp[int(np.argmax(r))] = 0
 
@@ -356,20 +406,23 @@ class GMMWM_Agent:
 
             self.learn(stimulus, true_label)
 
-            alpha_norm = self.alpha/np.sum(self.alpha)
-            to_erase = []
-            for i, p in enumerate(alpha_norm):
-                if p < 0.05 and self.v[i] > self.ceasefire:
-                    to_erase.append(i)
-                    #print('cluster too small, merging it')
-            for i in to_erase:
-                idx1 = copy.deepcopy(i)
-                if self.pruning['name'] == 'merging':
-                    idx1, idx2 = self.merging_check(idx1)
-                    self.cluster_merging(idx1, idx2)
-                elif self.pruning['name'] == 'erasing':
-                    self.erase_cluster()
-
+            #print(alpha_norm)
+            to_erase = [-1, -1]
+            while len(to_erase) > 0:
+                to_erase = []
+                alpha_norm = self.alpha/np.sum(self.alpha)
+                for i, p in enumerate(alpha_norm):
+                    if p < self.min_w and self.v[i] > self.ceasefire:
+                        to_erase.append(i)
+                        #print('cluster too small, merging it')
+                if len(to_erase) > 0:
+                    idx1 = to_erase[0]
+                    if self.pruning['name'] == 'merging':
+                        idx1, idx2 = self.merging_check(idx1)
+                        self.cluster_merging(idx1, idx2)        
+                    elif self.pruning['name'] == 'erasing':
+                        self.erase_cluster()
+                    
             if len(self.label) > self.max_clusters:
                 if self.pruning['name'] == 'merging':
                     idx1, idx2 = self.merging_check()
@@ -387,7 +440,7 @@ class GMMWM_Agent:
         action_probs = []
         for stimulus, true_label in zip(stimuli, labels):
             ap = self.trial(np.array(stimulus), true_label, feedback)
-        action_probs.append(ap)
+            action_probs.append(ap)
         return action_probs
         
       
