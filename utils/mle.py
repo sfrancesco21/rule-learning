@@ -13,6 +13,39 @@ def logit(p):
     return jnp.log(p) - jnp.log1p(-p)
 
 
+def _sample_uniform(key, low, high):
+    low = jnp.asarray(low, dtype=jnp.float32)
+    high = jnp.asarray(high, dtype=jnp.float32)
+    return low + (high - low) * jax.random.uniform(key, shape=low.shape, dtype=jnp.float32)
+
+
+def _bounded_interval(lower, upper, fallback_lower=None, fallback_upper=None):
+    lo = float(lower)
+    hi = float(upper)
+    if fallback_lower is not None:
+        lo = max(lo, float(fallback_lower))
+    if fallback_upper is not None:
+        hi = min(hi, float(fallback_upper))
+    if hi <= lo:
+        if fallback_lower is None or fallback_upper is None or float(fallback_upper) <= float(fallback_lower):
+            raise ValueError(f"Invalid initialization interval [{lo}, {hi}]")
+        lo = float(fallback_lower)
+        hi = float(fallback_upper)
+    return lo, hi
+
+
+def _sample_mu_pair_with_constraint(key, low, high, predicate, max_attempts=256):
+    current_key = key
+    last_candidate = None
+    for _ in range(max_attempts):
+        current_key, sample_key = jax.random.split(current_key)
+        candidate = _sample_uniform(sample_key, jnp.array([low, low]), jnp.array([high, high]))
+        last_candidate = candidate
+        if bool(predicate(candidate)):
+            return candidate
+    raise RuntimeError(f"Failed to sample a valid initial mean pair; last candidate was {last_candidate}.")
+
+
 # ---------------------------
 # New: build/init/unpack/prior
 # ---------------------------
@@ -43,31 +76,72 @@ def build_unconstrained_init(model, rng_key):
         slices[name] = slice(idx, idx + 1)
         idx += 1
 
-    # rng keys (enough for any combination)
-    keys = jax.random.split(rng_key, 16)
-    k = 0
+    init_bounds = {
+        "alpha": (0.1, 8.0),
+        "lapse_rate": (1e-3, 0.20),
+        "sigma_init": (0.25, 2.5),
+        "rho": (0.80, 0.999),
+        "eta_mu": (0.02, 0.80),
+        "eta_cov": (0.02, 0.60),
+        "mu_value": (0.5, 5.5),
+    }
 
-    # log_alpha (start near log(1))
-    add("log_alpha", jax.random.normal(keys[k], ()) * 0.1 + jnp.log(1.0)); k += 1
+    alpha_lo, alpha_hi = init_bounds["alpha"]
+    lapse_lo, lapse_hi = init_bounds["lapse_rate"]
+    sigma_lo, sigma_hi = _bounded_interval(
+        *init_bounds["sigma_init"],
+        fallback_lower=getattr(model, "sigma_init_min", 1e-3),
+        fallback_upper=getattr(model, "sigma_init_max", 10.0),
+    )
 
-    # logit_lapse (start near lapse ~0.05 => logit ~ -2.944)
-    add("logit_lapse", jax.random.normal(keys[k], ()) * 0.1 - 2.944); k += 1
-    add("log_sigma_init", jax.random.normal(keys[k], ()) * 0.1 + jnp.log(getattr(model, "sigma_init", 1.707))); k += 1
-
-    # initial means by label/dimension (unconstrained logits -> bounded in unpack)
-    mu_init_prior = jnp.asarray(getattr(model, "mu_init_prior", ((3.0, 3.0), (3.0, 3.0))), dtype=jnp.float32)
     mu_min = float(getattr(model, "mu_min", 0.0))
     mu_max = float(getattr(model, "mu_max", 6.0))
-    mu_scale = max(mu_max - mu_min, 1e-6)
-    mu_prior_unit = (mu_init_prior - mu_min) / mu_scale
-    add("logit_mu00", jax.random.normal(keys[k], ()) * 0.1 + logit(mu_prior_unit[0, 0])); k += 1
-    add("logit_mu01", jax.random.normal(keys[k], ()) * 0.1 + logit(mu_prior_unit[0, 1])); k += 1
-    add("logit_mu10", jax.random.normal(keys[k], ()) * 0.1 + logit(mu_prior_unit[1, 0])); k += 1
-    add("logit_mu11", jax.random.normal(keys[k], ()) * 0.1 + logit(mu_prior_unit[1, 1])); k += 1
+    mu_lo, mu_hi = _bounded_interval(
+        *init_bounds["mu_value"],
+        fallback_lower=mu_min,
+        fallback_upper=mu_max,
+    )
 
-    # forgetting rho (start near 0.98 => logit ~ 3.891)
+    current_key = rng_key
+
+    def next_key():
+        nonlocal current_key
+        current_key, sample_key = jax.random.split(current_key)
+        return sample_key
+
+    alpha = _sample_uniform(next_key(), alpha_lo, alpha_hi)
+    add("log_alpha", jnp.log(alpha))
+
+    lapse_rate = _sample_uniform(next_key(), lapse_lo, lapse_hi)
+    add("logit_lapse", logit(lapse_rate))
+
+    sigma_init = _sample_uniform(next_key(), sigma_lo, sigma_hi)
+    add("log_sigma_init", jnp.log(sigma_init))
+
+    mu_min = float(getattr(model, "mu_min", 0.0))
+    mu_scale = max(mu_max - mu_min, 1e-6)
+    mu0_init = _sample_mu_pair_with_constraint(
+        next_key(),
+        mu_lo,
+        mu_hi,
+        lambda candidate: jnp.abs(candidate[0] - candidate[1]) >= 1.5,
+    )
+    mu1_init = _sample_mu_pair_with_constraint(
+        next_key(),
+        mu_lo,
+        mu_hi,
+        lambda candidate: jnp.abs(candidate[0] - candidate[1]) <= 1.25,
+    )
+    mu0_unit = (mu0_init - mu_min) / mu_scale
+    mu1_unit = (mu1_init - mu_min) / mu_scale
+    add("logit_mu00", logit(mu0_unit[0]))
+    add("logit_mu01", logit(mu0_unit[1]))
+    add("logit_mu10", logit(mu1_unit[0]))
+    add("logit_mu11", logit(mu1_unit[1]))
+
     if getattr(model, "use_forgetting", False):
-        add("logit_rho", jax.random.normal(keys[k], ()) * 0.1 + 3.891); k += 1
+        rho = _sample_uniform(next_key(), *init_bounds["rho"])
+        add("logit_rho", logit(rho))
 
     # ---- Pull learning rates ----
     use_lr_mu = getattr(model, "use_lr_mu", False)
@@ -76,12 +150,15 @@ def build_unconstrained_init(model, rng_key):
 
     if (use_lr_mu or use_lr_cov):
         if use_lr_mu and use_lr_cov and tie_pull_lrs:
-            add("logit_eta", jax.random.normal(keys[k], ()) * 0.1 + 0.0); k += 1
+            eta = _sample_uniform(next_key(), *init_bounds["eta_mu"])
+            add("logit_eta", logit(eta))
         else:
             if use_lr_mu:
-                add("logit_eta_mu", jax.random.normal(keys[k], ()) * 0.1 + 0.0); k += 1
+                eta_mu = _sample_uniform(next_key(), *init_bounds["eta_mu"])
+                add("logit_eta_mu", logit(eta_mu))
             if use_lr_cov:
-                add("logit_eta_cov", jax.random.normal(keys[k], ()) * 0.1 + 0.0); k += 1
+                eta_cov = _sample_uniform(next_key(), *init_bounds["eta_cov"])
+                add("logit_eta_cov", logit(eta_cov))
 
     z0 = jnp.concatenate(parts, axis=0) if parts else jnp.zeros((0,), dtype=jnp.float32)
     return z0, slices
