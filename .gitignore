@@ -1,6 +1,14 @@
 <<<<<<< HEAD
 cake-venv
 Results
+#Sequences
+model_fits
+*.svg
+*.mat
+#*.json
+sbi.ipynb
+nuts_fit.ipynb
+archive
 =======
 # Byte-compiled / optimized / DLL files
 __pycache__/
