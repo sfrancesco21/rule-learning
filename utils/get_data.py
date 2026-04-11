@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 import glob
 import os
-import scipy
+from pathlib import Path
+from typing import Any, Dict
+
 import numpy as np
+import scipy
+
 
 def config_dict():
     counter = 0
@@ -13,45 +19,80 @@ def config_dict():
             conf[counter] = [r, l]
             label[counter] = int(abs(r - l) <= 1)
     return [conf, label]
-            
 
-def read_mat_files(base_dir='../Results'):
-    conf = config_dict()
-    data = {}
-    for N in range(1, 126):
-        folder_name = f'sbj{N}'
-        folder_path = os.path.join(base_dir, folder_name)
-        training_pattern = os.path.join(folder_path, f'sbj{N}Training*')
-        test_pattern     = os.path.join(folder_path, f'sbj{N}Test*')
-        
-        training_files = glob.glob(training_pattern)
-        test_files     = glob.glob(test_pattern)
-        if training_files and test_files:
-            training_file = training_files[0]
-            test_file = test_files[0]
-            training_data = scipy.io.loadmat(training_file)
-            test_data = scipy.io.loadmat(test_file)
-            data[N] = {
-                'training' : {
-                    'trialN' : [training_data['Results'][0][0][0][0][i][0][0][0] for i in range(training_data['Results'][0][0][0][0].shape[0])],
-                    'stimuli' : np.array([conf[0][training_data['Results'][0][0][0][0][i][1][0][0]] for i in range(training_data['Results'][0][0][0][0].shape[0])]),
-                    'labels' : np.array([conf[1][training_data['Results'][0][0][0][0][i][1][0][0]] for i in range(training_data['Results'][0][0][0][0].shape[0])]),
-                    'outcome' : [training_data['Results'][0][0][0][0][i][2][0][0] for i in range(training_data['Results'][0][0][0][0].shape[0])], 
-                    'action' : np.array([training_data['Results'][0][0][0][0][i][4][0][0] for i in range(training_data['Results'][0][0][0][0].shape[0])]),
-                    'trialLost' : np.array([training_data['Results'][0][0][0][0][i][6][0][0] for i in range(training_data['Results'][0][0][0][0].shape[0])])
-                },
-                'test' : {
-                    'trialN' : [test_data['Results'][0][0][0][0][i][0][0][0] for i in range(test_data['Results'][0][0][0][0].shape[0])],
-                    'stimuli' : np.array([conf[0][test_data['Results'][0][0][0][0][i][1][0][0]] for i in range(test_data['Results'][0][0][0][0].shape[0])]),
-                    'labels' : np.array([conf[1][test_data['Results'][0][0][0][0][i][1][0][0]] for i in range(test_data['Results'][0][0][0][0].shape[0])]),
-                    'outcome' : [test_data['Results'][0][0][0][0][i][2][0][0] for i in range(test_data['Results'][0][0][0][0].shape[0])], 
-                    'action' : np.array([test_data['Results'][0][0][0][0][i][4][0][0] for i in range(test_data['Results'][0][0][0][0].shape[0])]),
-                    'trialLost' : np.array([test_data['Results'][0][0][0][0][i][6][0][0] for i in range(test_data['Results'][0][0][0][0].shape[0])])
-                }
-            }
-            #data[N] = {'training': training_data, 'test': test_data}
+
+def find_results_dir(base_dir: str | os.PathLike[str] | None = None) -> str:
+    if base_dir is not None:
+        base_path = Path(base_dir).expanduser()
+        candidates = []
+        if base_path.is_absolute():
+            candidates.append(base_path.resolve())
         else:
-            print(f"Files for {folder_name} not found in {base_dir}.")
+            candidates.extend(
+                [
+                    base_path.resolve(),
+                    (Path(__file__).resolve().parent / base_path).resolve(),
+                    (Path(__file__).resolve().parents[1] / base_path).resolve(),
+                ]
+            )
+        for candidate in candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        raise FileNotFoundError(f"Results directory not found. Tried: {', '.join(str(p) for p in candidates)}")
+
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / "Results",
+        root.parent / "Results",
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return str(candidate.resolve())
+    raise FileNotFoundError("Could not find Results directory. Tried ./Results and ../Results.")
+
+
+def _load_phase_data(mat_data: Dict[str, Any], conf) -> Dict[str, Any]:
+    results = mat_data["Results"][0][0][0][0]
+    n_trials = results.shape[0]
+    return {
+        "trialN": [results[i][0][0][0] for i in range(n_trials)],
+        "stimuli": np.array([conf[0][results[i][1][0][0]] for i in range(n_trials)]),
+        "labels": np.array([conf[1][results[i][1][0][0]] for i in range(n_trials)]),
+        "outcome": [results[i][2][0][0] for i in range(n_trials)],
+        "action": np.array([results[i][4][0][0] for i in range(n_trials)]),
+        "trialLost": np.array([results[i][6][0][0] for i in range(n_trials)]),
+    }
+
+
+def load_participant_data(participant_id: int, base_dir: str | os.PathLike[str] | None = None) -> Dict[str, Any]:
+    conf = config_dict()
+    resolved_base_dir = find_results_dir(base_dir)
+    folder_name = f"sbj{int(participant_id)}"
+    folder_path = os.path.join(resolved_base_dir, folder_name)
+    training_pattern = os.path.join(folder_path, f"{folder_name}Training*")
+    test_pattern = os.path.join(folder_path, f"{folder_name}Test*")
+
+    training_files = glob.glob(training_pattern)
+    test_files = glob.glob(test_pattern)
+    if not training_files or not test_files:
+        raise FileNotFoundError(f"Files for {folder_name} not found in {resolved_base_dir}.")
+
+    training_data = scipy.io.loadmat(training_files[0])
+    test_data = scipy.io.loadmat(test_files[0])
+    return {
+        "training": _load_phase_data(training_data, conf),
+        "test": _load_phase_data(test_data, conf),
+    }
+
+
+def read_mat_files(base_dir: str | os.PathLike[str] | None = None):
+    resolved_base_dir = find_results_dir(base_dir)
+    data = {}
+    for participant_id in range(1, 126):
+        try:
+            data[participant_id] = load_participant_data(participant_id, resolved_base_dir)
+        except FileNotFoundError:
+            print(f"Files for sbj{participant_id} not found in {resolved_base_dir}.")
     return data
 
 

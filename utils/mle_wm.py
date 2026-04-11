@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, Any, Iterable, Optional
 
 import numpy as np
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import minimize
 
 
 def _logit(p: float) -> float:
@@ -23,6 +23,7 @@ def fit_last_m_mle(
     M1_grid: Optional[Iterable[int]] = None,
     lapse_bounds=(1e-6, 0.49),
     use_category_specific_memory: Optional[bool] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, Any]:
     """
     MLE fit for LastMInverseDistanceModel.
@@ -60,21 +61,34 @@ def fit_last_m_mle(
                 )
                 return -float(ll)
 
-            out = minimize_scalar(
-                objective_lapse,
-                method="bounded",
-                bounds=(float(lapse_bounds[0]), float(lapse_bounds[1])),
-                options={"xatol": 1e-4},
-            )
+            if rng is None:
+                x0_lapse = 0.5 * (float(lapse_bounds[0]) + float(lapse_bounds[1]))
+                out = minimize(
+                    lambda z: objective_lapse(z[0]),
+                    x0=np.array([x0_lapse], dtype=float),
+                    method="L-BFGS-B",
+                    bounds=[(float(lapse_bounds[0]), float(lapse_bounds[1]))],
+                )
+            else:
+                x0_lapse = float(rng.uniform(float(lapse_bounds[0]), float(lapse_bounds[1])))
+                out = minimize(
+                    lambda z: objective_lapse(z[0]),
+                    x0=np.array([x0_lapse], dtype=float),
+                    method="L-BFGS-B",
+                    bounds=[(float(lapse_bounds[0]), float(lapse_bounds[1]))],
+                )
 
-            lapse_hat = float(out.x)
+            lapse_hat = float(out.x[0] if np.ndim(out.x) > 0 else out.x)
             ll_hat = -float(out.fun)
             run = {
                 "M": M_int,
+                "x0_lapse_rate": x0_lapse,
                 "lapse_rate": lapse_hat,
                 "loglik": ll_hat,
                 "success": bool(out.success),
                 "nit": int(getattr(out, "nit", -1)),
+                "nfev": int(getattr(out, "nfev", -1)),
+                "message": str(getattr(out, "message", "")),
                 "use_category_specific_memory": False,
             }
             all_runs.append(run)
@@ -105,22 +119,35 @@ def fit_last_m_mle(
                     )
                     return -float(ll)
 
-                out = minimize_scalar(
-                    objective_lapse,
-                    method="bounded",
-                    bounds=(float(lapse_bounds[0]), float(lapse_bounds[1])),
-                    options={"xatol": 1e-4},
-                )
+                if rng is None:
+                    x0_lapse = 0.5 * (float(lapse_bounds[0]) + float(lapse_bounds[1]))
+                    out = minimize(
+                        lambda z: objective_lapse(z[0]),
+                        x0=np.array([x0_lapse], dtype=float),
+                        method="L-BFGS-B",
+                        bounds=[(float(lapse_bounds[0]), float(lapse_bounds[1]))],
+                    )
+                else:
+                    x0_lapse = float(rng.uniform(float(lapse_bounds[0]), float(lapse_bounds[1])))
+                    out = minimize(
+                        lambda z: objective_lapse(z[0]),
+                        x0=np.array([x0_lapse], dtype=float),
+                        method="L-BFGS-B",
+                        bounds=[(float(lapse_bounds[0]), float(lapse_bounds[1]))],
+                    )
 
-                lapse_hat = float(out.x)
+                lapse_hat = float(out.x[0] if np.ndim(out.x) > 0 else out.x)
                 ll_hat = -float(out.fun)
                 run = {
                     "M0": M0_int,
                     "M1": M1_int,
+                    "x0_lapse_rate": x0_lapse,
                     "lapse_rate": lapse_hat,
                     "loglik": ll_hat,
                     "success": bool(out.success),
                     "nit": int(getattr(out, "nit", -1)),
+                    "nfev": int(getattr(out, "nfev", -1)),
+                    "message": str(getattr(out, "message", "")),
                     "use_category_specific_memory": True,
                 }
                 all_runs.append(run)
@@ -150,6 +177,7 @@ def fit_exp_decay_mle(
     lapse_bounds=(1e-6, 0.49),
     x0: Optional[Dict[str, float]] = None,
     use_dual_decay: Optional[bool] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, Any]:
     """
     MLE fit for ExponentialDecayInverseDistanceModel.
@@ -162,13 +190,21 @@ def fit_exp_decay_mle(
     )
 
     if x0 is None:
-        x0 = {"lapse_rate": 0.05}
+        x0 = {}
     l_lo, l_hi = float(lapse_bounds[0]), float(lapse_bounds[1])
     l_scale = max(l_hi - l_lo, 1e-12)
+    if "lapse_rate" not in x0:
+        if rng is None:
+            x0["lapse_rate"] = 0.05
+        else:
+            x0["lapse_rate"] = float(rng.uniform(l_lo, l_hi))
 
     if not use_dual:
         if "decay_rate" not in x0:
-            x0["decay_rate"] = float(getattr(model, "decay_rate", 0.1))
+            if rng is None:
+                x0["decay_rate"] = float(getattr(model, "decay_rate", 0.1))
+            else:
+                x0["decay_rate"] = float(rng.uniform(float(decay_bounds[0]), float(decay_bounds[1])))
         d_lo, d_hi = float(decay_bounds[0]), float(decay_bounds[1])
         d_scale = max(d_hi - d_lo, 1e-12)
         d0_u = (float(x0["decay_rate"]) - d_lo) / d_scale
@@ -203,9 +239,15 @@ def fit_exp_decay_mle(
         }
     else:
         if "decay_time" not in x0:
-            x0["decay_time"] = float(getattr(model, "decay_time", 0.1))
+            if rng is None:
+                x0["decay_time"] = float(getattr(model, "decay_time", 0.1))
+            else:
+                x0["decay_time"] = float(rng.uniform(float(decay_time_bounds[0]), float(decay_time_bounds[1])))
         if "decay_count" not in x0:
-            x0["decay_count"] = float(getattr(model, "decay_count", 0.1))
+            if rng is None:
+                x0["decay_count"] = float(getattr(model, "decay_count", 0.1))
+            else:
+                x0["decay_count"] = float(rng.uniform(float(decay_count_bounds[0]), float(decay_count_bounds[1])))
 
         dt_lo, dt_hi = float(decay_time_bounds[0]), float(decay_time_bounds[1])
         dc_lo, dc_hi = float(decay_count_bounds[0]), float(decay_count_bounds[1])
@@ -254,4 +296,5 @@ def fit_exp_decay_mle(
         "message": str(out.message),
         "nfev": int(getattr(out, "nfev", -1)),
         "nit": int(getattr(out, "nit", -1)),
+        "x0": {k: float(v) for k, v in x0.items()},
     }
